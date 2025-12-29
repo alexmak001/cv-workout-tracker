@@ -1,6 +1,10 @@
 import time
 import math
 import argparse
+import sys
+from pathlib import Path
+from urllib.error import URLError
+from urllib.request import urlretrieve
 
 import cv2
 from ultralytics import YOLO
@@ -11,6 +15,14 @@ import numpy as np
 # CONFIG / TUNING PARAMETERS
 # ===============================
 
+# --- Model download/cache ---
+MODEL_DIR = Path("models")
+DEFAULT_MODEL_NAME = "yolov8n-pose.pt"
+DEFAULT_MODEL_URL = (
+    "https://github.com/ultralytics/assets/releases/download/v0.0.0/yolov8n-pose.pt"
+)
+DEFAULT_MODEL_PATH = MODEL_DIR / DEFAULT_MODEL_NAME
+
 # --- Pose & detection ---
 MIN_KEYPOINT_CONFIDENCE = 0.4   # TUNE_ME: raise if jittery/missing keypoints
 
@@ -20,13 +32,13 @@ SMOOTHING_ALPHA = 0.2           # TUNE_ME: 0.1–0.3; higher = smoother but more
 # --- Pull-up thresholds (normalized left shoulder Y in [0,1]) ---
 # IMPORTANT: Y increases downward in images.
 # So "top" (chin over bar) = smaller y, "bottom" (dead hang) = larger y.
-PULLUP_BOTTOM_THRESH = 0.65     # TUNE_ME: y_norm near the bottom position
-PULLUP_TOP_THRESH = 0.45        # TUNE_ME: y_norm near the top position
+PULLUP_TOP_THRESH    = 0.33   # above your top band
+PULLUP_BOTTOM_THRESH = 0.38   # below your bottom band
 
 # --- Dip thresholds (left elbow angle in degrees) ---
 # Typical: top of dip ~160–180°, bottom ~70–110° (depends on your form)
 DIP_TOP_ANGLE = 150.0           # TUNE_ME: angle at/near lockout
-DIP_BOTTOM_ANGLE = 100.0        # TUNE_ME: angle at deepest part
+DIP_BOTTOM_ANGLE = 90.0        # TUNE_ME: angle at deepest part
 
 # --- Rep debounce ---
 MIN_TIME_BETWEEN_REPS = 0.35    # TUNE_ME: seconds; avoid double-counting fast jitters
@@ -232,90 +244,338 @@ def draw_overlay(frame, mode, rep_count, state, extra_value=None):
     text_reps = f"Reps: {rep_count}"
     text_state = f"State: {state}"
 
-    cv2.putText(frame, text_mode, (10, 25), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 255, 255), 2)
-    cv2.putText(frame, text_reps, (10, 50), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 255, 0), 2)
-    cv2.putText(frame, text_state, (10, 75), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 255, 255), 1)
+    cv2.putText(frame, text_mode, (10, 30), cv2.FONT_HERSHEY_SIMPLEX, 1.2, (0, 255, 255), 3)
+    cv2.putText(frame, text_reps, (10, 65), cv2.FONT_HERSHEY_SIMPLEX, 1.2, (0, 255, 0), 3)
+    cv2.putText(frame, text_state, (10, 100), cv2.FONT_HERSHEY_SIMPLEX, 1.0, (255, 255, 255), 2)
 
     if extra_value is not None:
         if mode == "pullup":
             t = f"Left shoulder y_norm: {extra_value:.3f}"
         else:
             t = f"Left elbow angle: {extra_value:.1f} deg"
-        cv2.putText(frame, t, (10, h - 20), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 200, 0), 2)
+        cv2.putText(frame, t, (10, h - 25), cv2.FONT_HERSHEY_SIMPLEX, 1.0, (255, 200, 0), 3)
 
     return frame
+
+
+def ensure_model_path(model_arg):
+    model_path = Path(model_arg)
+    if model_path.is_file():
+        return model_path
+
+    if model_path.name == DEFAULT_MODEL_NAME:
+        target = model_path
+        if model_path.parent == Path("."):
+            target = DEFAULT_MODEL_PATH
+
+        target.parent.mkdir(parents=True, exist_ok=True)
+        if not target.exists():
+            print(f"Downloading {DEFAULT_MODEL_NAME} to {target}...")
+            try:
+                urlretrieve(DEFAULT_MODEL_URL, target)
+            except URLError as exc:
+                raise RuntimeError(
+                    f"Failed to download model from {DEFAULT_MODEL_URL}: {exc}"
+                ) from exc
+        return target
+
+    return model_path
 
 
 def main():
     parser = argparse.ArgumentParser(description="YOLO-based rep counter (pullups & dips, LEFT-side view).")
     parser.add_argument("--mode", choices=["pullup", "dip"], required=True,
                         help="Exercise mode: pullup or dip")
-    parser.add_argument("--model", type=str, default="yolov8n-pose.pt",
+    parser.add_argument("--model", type=str, default=str(DEFAULT_MODEL_PATH),
                         help="Path to YOLO pose model (e.g., yolov8n-pose.pt)")
     parser.add_argument("--video", type=str, default=None,
                         help="Path to video file. If not set, use webcam 0.")
+    parser.add_argument("--camera", type=int, default=0,
+                        help="Camera index (webcam mode only).")
+    parser.add_argument("--backend", type=str, default=None,
+                        choices=["avfoundation", "any", "default"],
+                        help="OpenCV backend: avfoundation, any, or default.")
+    parser.add_argument("--calibrate", action="store_true",
+                        help="Calibration mode (pullup or dip). Press b/t to sample, r to reset.")
     args = parser.parse_args()
 
-    print(f"Loading model: {args.model}")
-    model = YOLO(args.model)
+    model_path = ensure_model_path(args.model)
+    print(f"Loading model: {model_path}")
+    model = YOLO(str(model_path))
+
+    def open_camera(camera_index, backend_choice):
+        if backend_choice == "avfoundation" and sys.platform == "darwin":
+            print(f"Opening camera index {camera_index} with backend=avfoundation")
+            return cv2.VideoCapture(camera_index, cv2.CAP_AVFOUNDATION)
+        print(f"Opening camera index {camera_index} with backend={backend_choice}")
+        return cv2.VideoCapture(camera_index)
 
     if args.video is None:
-        cap = cv2.VideoCapture(0)  # TUNE_ME: change index if wrong camera
+        if args.backend is None:
+            backend_choice = "avfoundation" if sys.platform == "darwin" else "default"
+        else:
+            backend_choice = args.backend
+        cap = open_camera(args.camera, backend_choice)
     else:
         cap = cv2.VideoCapture(args.video)
 
     if not cap.isOpened():
         print("Error: Could not open video source.")
         return
+    if args.video is None:
+        start_warmup = time.time()
+        warmup_frames = 0
+        while warmup_frames < 20 and (time.time() - start_warmup) < 1.0:
+            ret, _ = cap.read()
+            if ret:
+                warmup_frames += 1
 
     if args.mode == "pullup":
         counter = RepCounterPullup()
     else:
         counter = RepCounterDip()
 
-    print("Press 'q' to quit.")
+    paused = False
+    if args.calibrate:
+        print("Calibration mode: press 'b' (bottom), 't' (top), 'r' (reset), 'q' (quit).")
+    else:
+        print("Press 'q' to quit.")
+
+    # --- Calibration-only state (pullups only) ---
+    bottom_samples = []
+    top_samples = []
+    last_suggested = None
+    last_frame = None
+    last_result = None
+    last_kp_dict = None
+    last_extra_val = None
+    last_rep_count = 0
+    last_state = "WAITING_FOR_REP"
+    last_suggested_msg = None
+    last_suggested_time = 0.0
+    button_rect = (0, 0, 0, 0)
+    window_name = "Rep Counter (Left Side)"
+
+    def on_mouse(event, x, y, flags, userdata):
+        nonlocal paused
+        if event == cv2.EVENT_LBUTTONDOWN:
+            x1, y1, x2, y2 = button_rect
+            if x1 <= x <= x2 and y1 <= y <= y2:
+                paused = not paused
+
+    cv2.namedWindow(window_name)
+    cv2.setMouseCallback(window_name, on_mouse)
 
     while True:
-        ret, frame = cap.read()
-        if not ret:
-            break
+        if not paused:
+            if args.video is None:
+                ret, frame = cap.read()
+                if not ret:
+                    print("Frame read failed, retrying for up to 2 seconds...")
+                    start_retry = time.time()
+                    while (time.time() - start_retry) < 2.0:
+                        time.sleep(0.05)
+                        ret, frame = cap.read()
+                        if ret:
+                            break
+                    if not ret:
+                        print("Reopening camera after read failures...")
+                        cap.release()
+                        cap = open_camera(args.camera, backend_choice)
+                        if not cap.isOpened():
+                            print("Error: Could not reopen camera. Exiting.")
+                            break
+                        start_warmup = time.time()
+                        warmup_frames = 0
+                        while warmup_frames < 20 and (time.time() - start_warmup) < 1.0:
+                            ret, _ = cap.read()
+                            if ret:
+                                warmup_frames += 1
+                        ret, frame = cap.read()
+                        if not ret:
+                            print("Error: Camera read failed after reopen. Exiting.")
+                            break
+            else:
+                ret, frame = cap.read()
+                if not ret:
+                    break
 
+            frame_h, frame_w = frame.shape[:2]
+            last_frame = frame.copy()
+
+            results = model(frame, verbose=False)
+            result = results[0]
+            last_result = result
+
+            kp_dict = get_keypoints_dict(result)
+            last_kp_dict = kp_dict
+
+            now = time.time()
+            extra_val = None
+
+            if args.mode == "pullup":
+                y_norm = None
+                if kp_dict is not None:
+                    y_norm = compute_left_shoulder_y_norm(kp_dict, frame_h)
+                extra_val = y_norm
+                rep_count, state = counter.update(y_norm, now)
+            else:  # dip
+                angle = None
+                if kp_dict is not None:
+                    angle = angle_at_left_elbow(kp_dict)
+                extra_val = angle
+                rep_count, state = counter.update(angle, now)
+
+            last_extra_val = extra_val
+            last_rep_count = rep_count
+            last_state = state
+
+        if last_frame is None:
+            continue
+
+        frame = last_frame.copy()
         frame_h, frame_w = frame.shape[:2]
-
-        results = model(frame, verbose=False)
-        result = results[0]
-
-        kp_dict = get_keypoints_dict(result)
-
-        now = time.time()
-        extra_val = None
-
-        if args.mode == "pullup":
-            y_norm = None
-            if kp_dict is not None:
-                y_norm = compute_left_shoulder_y_norm(kp_dict, frame_h)
-            extra_val = y_norm
-            rep_count, state = counter.update(y_norm, now)
-
-        else:  # dip
-            angle = None
-            if kp_dict is not None:
-                angle = angle_at_left_elbow(kp_dict)
-            extra_val = angle
-            rep_count, state = counter.update(angle, now)
+        rep_count = last_rep_count
+        state = last_state
+        extra_val = last_extra_val
+        result = last_result
+        kp_dict = last_kp_dict
 
         # Draw left-side keypoints for debugging
-        if result.keypoints is not None and len(result.keypoints) > 0:
+        if result is not None and result.keypoints is not None and len(result.keypoints) > 0:
             for person in result.keypoints.xy:
                 for x, y in person:
                     cv2.circle(frame, (int(x), int(y)), 3, (0, 0, 255), -1)
 
         frame = draw_overlay(frame, args.mode, rep_count, state, extra_value=extra_val)
 
-        cv2.imshow("Rep Counter (Left Side)", frame)
+        # --- Calibration-only behavior (pullups) ---
+        if args.calibrate and args.mode == "pullup":
+            smooth_y = counter.smooth_y
+            if smooth_y is not None:
+                cv2.putText(
+                    frame,
+                    f"y_norm (smoothed): {smooth_y:.3f}",
+                    (10, 140),
+                    cv2.FONT_HERSHEY_SIMPLEX,
+                    1.0,
+                    (255, 255, 0),
+                    3,
+                )
+
+            if len(bottom_samples) >= 3 and len(top_samples) >= 3:
+                bottom_mean = float(np.mean(bottom_samples))
+                bottom_min = float(np.min(bottom_samples))
+                bottom_max = float(np.max(bottom_samples))
+                top_mean = float(np.mean(top_samples))
+                top_min = float(np.min(top_samples))
+                top_max = float(np.max(top_samples))
+
+                suggested_top = (top_max + bottom_min) / 2.0
+                suggested_bottom = max(0.0, min(1.0, bottom_min - 0.05))
+                last_suggested = (suggested_top, suggested_bottom)
+
+                y0 = 175
+                step = 26
+                cv2.putText(frame, f"bottom mean/min/max: {bottom_mean:.3f} / {bottom_min:.3f} / {bottom_max:.3f}",
+                            (10, y0), cv2.FONT_HERSHEY_SIMPLEX, 0.8, (200, 255, 200), 2)
+                cv2.putText(frame, f"top    mean/min/max: {top_mean:.3f} / {top_min:.3f} / {top_max:.3f}",
+                            (10, y0 + step), cv2.FONT_HERSHEY_SIMPLEX, 0.8, (200, 255, 200), 2)
+                cv2.putText(frame, f"suggested top/bottom: {suggested_top:.3f} / {suggested_bottom:.3f}",
+                            (10, y0 + 2 * step), cv2.FONT_HERSHEY_SIMPLEX, 0.8, (200, 255, 0), 2)
+        elif args.calibrate and args.mode == "dip":
+            smooth_angle = counter.smooth_angle
+            if smooth_angle is not None:
+                cv2.putText(
+                    frame,
+                    f"elbow angle (smoothed): {smooth_angle:.1f} deg",
+                    (10, 140),
+                    cv2.FONT_HERSHEY_SIMPLEX,
+                    1.0,
+                    (255, 255, 0),
+                    3,
+                )
+
+            if len(bottom_samples) >= 3 and len(top_samples) >= 3:
+                bottom_mean = float(np.mean(bottom_samples))
+                bottom_min = float(np.min(bottom_samples))
+                bottom_max = float(np.max(bottom_samples))
+                top_mean = float(np.mean(top_samples))
+                top_min = float(np.min(top_samples))
+                top_max = float(np.max(top_samples))
+
+                suggested_bottom = bottom_max + 5.0
+                suggested_top = top_min - 5.0
+                if suggested_bottom >= suggested_top:
+                    suggested_bottom = bottom_max
+                    suggested_top = top_min
+                last_suggested = (suggested_top, suggested_bottom)
+
+                y0 = 175
+                step = 26
+                cv2.putText(frame, f"bottom mean/min/max: {bottom_mean:.1f} / {bottom_min:.1f} / {bottom_max:.1f}",
+                            (10, y0), cv2.FONT_HERSHEY_SIMPLEX, 0.8, (200, 255, 200), 2)
+                cv2.putText(frame, f"top    mean/min/max: {top_mean:.1f} / {top_min:.1f} / {top_max:.1f}",
+                            (10, y0 + step), cv2.FONT_HERSHEY_SIMPLEX, 0.8, (200, 255, 200), 2)
+                cv2.putText(frame, f"suggested top/bottom: {suggested_top:.1f} / {suggested_bottom:.1f}",
+                            (10, y0 + 2 * step), cv2.FONT_HERSHEY_SIMPLEX, 0.8, (200, 255, 0), 2)
+
+        if paused:
+            cv2.putText(frame, "PAUSED", (10, frame_h - 30),
+                        cv2.FONT_HERSHEY_SIMPLEX, 1.2, (0, 0, 255), 3)
+
+        # Pause/Play button (top-right)
+        btn_w, btn_h = 150, 50
+        margin = 10
+        x2 = frame_w - margin
+        y1 = margin
+        x1 = x2 - btn_w
+        y2 = y1 + btn_h
+        button_rect = (x1, y1, x2, y2)
+        cv2.rectangle(frame, (x1, y1), (x2, y2), (30, 30, 30), -1)
+        label = "PLAY" if paused else "PAUSE"
+        cv2.putText(frame, label, (x1 + 15, y1 + 34),
+                    cv2.FONT_HERSHEY_SIMPLEX, 1.0, (255, 255, 255), 3)
+
+        cv2.imshow(window_name, frame)
         key = cv2.waitKey(1) & 0xFF
-        if key == ord("q"):
-            break
+        if key == 32:
+            paused = not paused
+        if args.calibrate:
+            if args.mode == "pullup":
+                if key == ord("b") and counter.smooth_y is not None:
+                    bottom_samples.append(counter.smooth_y)
+                elif key == ord("t") and counter.smooth_y is not None:
+                    top_samples.append(counter.smooth_y)
+            elif args.mode == "dip":
+                if key == ord("b") and counter.smooth_angle is not None:
+                    bottom_samples.append(counter.smooth_angle)
+                elif key == ord("t") and counter.smooth_angle is not None:
+                    top_samples.append(counter.smooth_angle)
+
+            if key == ord("r"):
+                bottom_samples = []
+                top_samples = []
+                last_suggested = None
+                last_suggested_msg = None
+            elif key == ord("q"):
+                break
+        else:
+            if key == ord("q"):
+                break
+
+        now = time.time()
+        if args.calibrate and last_suggested is not None:
+            if args.mode == "pullup":
+                msg = (f"Suggested thresholds: top={last_suggested[0]:.3f}, "
+                       f"bottom={last_suggested[1]:.3f}")
+            else:
+                msg = (f"Suggested dip thresholds: top_angle={last_suggested[0]:.1f}, "
+                       f"bottom_angle={last_suggested[1]:.1f}")
+            if msg != last_suggested_msg or (now - last_suggested_time) >= 1.0:
+                print(msg)
+                last_suggested_msg = msg
+                last_suggested_time = now
 
     cap.release()
     cv2.destroyAllWindows()

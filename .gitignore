@@ -1,1 +1,8 @@
 .venv/
+
+*.mp4
+
+testVids/
+
+*.pt
+models/
