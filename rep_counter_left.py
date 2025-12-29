@@ -44,14 +44,8 @@ DIP_BOTTOM_ANGLE = 90.0        # TUNE_ME: angle at deepest part
 MIN_TIME_BETWEEN_REPS = 0.35    # TUNE_ME: seconds; avoid double-counting fast jitters
 
 # --- Auto-detect tuning ---
-DETECT_WINDOW_SECONDS = 2.0     # TUNE_ME: seconds to collect detection samples
-REST_SECONDS = 4.0              # TUNE_ME: seconds of rest to reset auto mode
-SHOULDER_RANGE_THRESH = 0.06    # TUNE_ME: y_norm range to indicate pullups
-ELBOW_RANGE_THRESH = 30.0       # TUNE_ME: angle range to indicate dips
-DOMINANCE_K = 1.3               # TUNE_ME: shoulder range dominance vs elbow range
-MOTION_EPS_Y = 0.01             # TUNE_ME: y_norm delta to count as movement
-MOTION_EPS_ANGLE = 3.0          # TUNE_ME: angle delta (deg) to count as movement
-MIN_DETECT_SAMPLES = 5          # TUNE_ME: minimum samples per signal for detection
+WS_PULLUP_THRESH = 0.03        # TUNE_ME: wrist above shoulder
+WS_DIP_THRESH = -0.03          # TUNE_ME: wrist below shoulder
 
 
 # ===============================
@@ -247,23 +241,24 @@ def draw_overlay(frame, mode, rep_count, state, extra_value=None):
 
     # translucent top bar
     overlay = frame.copy()
-    cv2.rectangle(overlay, (0, 0), (w, 80), (0, 0, 0), -1)
+    cv2.rectangle(overlay, (0, 0), (w, 140), (0, 0, 0), -1)
     frame = cv2.addWeighted(overlay, 0.4, frame, 0.6, 0)
 
     text_mode = f"Mode: {mode.upper()} (LEFT SIDE VIEW)"
     text_reps = f"Reps: {rep_count}"
     text_state = f"State: {state}"
 
-    cv2.putText(frame, text_mode, (10, 30), cv2.FONT_HERSHEY_SIMPLEX, 1.2, (0, 255, 255), 3)
-    cv2.putText(frame, text_reps, (10, 65), cv2.FONT_HERSHEY_SIMPLEX, 1.2, (0, 255, 0), 3)
-    cv2.putText(frame, text_state, (10, 100), cv2.FONT_HERSHEY_SIMPLEX, 1.0, (255, 255, 255), 2)
+    cv2.putText(frame, text_mode, (10, 45), cv2.FONT_HERSHEY_SIMPLEX, 1.6, (0, 255, 255), 4)
+    cv2.putText(frame, text_reps, (10, 90), cv2.FONT_HERSHEY_SIMPLEX, 1.6, (0, 255, 0), 4)
+    cv2.putText(frame, text_state, (10, 130), cv2.FONT_HERSHEY_SIMPLEX, 1.3, (255, 255, 255), 3)
 
     if extra_value is not None:
         if mode == "pullup":
             t = f"Left shoulder y_norm: {extra_value:.3f}"
-        else:
+            cv2.putText(frame, t, (10, h - 30), cv2.FONT_HERSHEY_SIMPLEX, 1.4, (255, 200, 0), 4)
+        elif mode == "dip":
             t = f"Left elbow angle: {extra_value:.1f} deg"
-        cv2.putText(frame, t, (10, h - 25), cv2.FONT_HERSHEY_SIMPLEX, 1.0, (255, 200, 0), 3)
+            cv2.putText(frame, t, (10, h - 30), cv2.FONT_HERSHEY_SIMPLEX, 1.4, (255, 200, 0), 4)
 
     return frame
 
@@ -346,19 +341,19 @@ def main():
                 warmup_frames += 1
 
     if args.auto:
-        pullup_counter = RepCounterPullup()
-        dip_counter = RepCounterDip()
+        if args.mode in ("pullup", "dip"):
+            counter = RepCounterPullup() if args.mode == "pullup" else RepCounterDip()
     else:
         if args.mode == "pullup":
             counter = RepCounterPullup()
         else:
             counter = RepCounterDip()
-    if args.auto and args.mode in ("pullup", "dip"):
-        counter = pullup_counter if args.mode == "pullup" else dip_counter
 
     paused = False
     if args.calibrate:
         print("Calibration mode: press 'b' (bottom), 't' (top), 'r' (reset), 'q' (quit).")
+    if args.auto:
+        print("Auto mode: press '1' for pullup, '2' for dip, '0' to return to auto-detect.")
     else:
         print("Press 'q' to quit.")
 
@@ -374,21 +369,13 @@ def main():
     last_state = "WAITING_FOR_REP"
     last_suggested_msg = None
     last_suggested_time = 0.0
-    auto_state = "IDLE"
-    locked_mode = None
-    detect_start_time = None
-    detect_shoulder_vals = []
-    detect_elbow_vals = []
-    auto_smooth_y = None
-    auto_smooth_angle = None
-    last_auto_smooth_y = None
-    last_auto_smooth_angle = None
-    last_motion_time = None
-    last_detect_shoulder_range = 0.0
-    last_detect_elbow_range = 0.0
+    detected_exercise = None
+    active_counter = None
+    active_mode = "auto"
+    last_ws = None
     last_overlay_mode = "auto" if args.auto else args.mode
-    last_auto_state = auto_state
-    last_locked_mode = locked_mode
+    last_detected_exercise = detected_exercise
+    last_active_mode = active_mode
     button_rect = (0, 0, 0, 0)
     window_name = "Rep Counter (Left Side)"
 
@@ -450,104 +437,61 @@ def main():
             extra_val = None
             y_norm = None
             angle = None
+            wrist_vs_shoulder = None
             if kp_dict is not None:
                 y_norm = compute_left_shoulder_y_norm(kp_dict, frame_h)
                 angle = angle_at_left_elbow(kp_dict)
+                ls = kp_dict.get("left_shoulder")
+                lw = kp_dict.get("left_wrist")
+                if ls is not None and lw is not None:
+                    _, y_s, c_s = ls
+                    _, y_w, c_w = lw
+                    if c_s >= MIN_KEYPOINT_CONFIDENCE and c_w >= MIN_KEYPOINT_CONFIDENCE:
+                        wrist_vs_shoulder = (y_s - y_w) / float(frame_h)
 
             if args.auto:
-                if y_norm is not None:
-                    auto_smooth_y = exponential_smooth(y_norm, auto_smooth_y, SMOOTHING_ALPHA)
-                if angle is not None:
-                    auto_smooth_angle = exponential_smooth(angle, auto_smooth_angle, SMOOTHING_ALPHA)
+                if wrist_vs_shoulder is not None:
+                    last_ws = wrist_vs_shoulder
+                    if wrist_vs_shoulder >= WS_PULLUP_THRESH:
+                        detected_exercise = "pullup"
+                    elif wrist_vs_shoulder <= WS_DIP_THRESH:
+                        detected_exercise = "dip"
 
-                moved = False
-                if auto_smooth_y is not None and last_auto_smooth_y is not None:
-                    if abs(auto_smooth_y - last_auto_smooth_y) > MOTION_EPS_Y:
-                        moved = True
-                if auto_smooth_angle is not None and last_auto_smooth_angle is not None:
-                    if abs(auto_smooth_angle - last_auto_smooth_angle) > MOTION_EPS_ANGLE:
-                        moved = True
-                if moved:
-                    last_motion_time = now
-
-                last_auto_smooth_y = auto_smooth_y
-                last_auto_smooth_angle = auto_smooth_angle
-
-                if auto_state == "IDLE":
-                    if moved:
-                        auto_state = "DETECTING"
-                        detect_start_time = now
-                        detect_shoulder_vals = []
-                        detect_elbow_vals = []
-
-                if auto_state == "DETECTING":
-                    if auto_smooth_y is not None:
-                        detect_shoulder_vals.append(auto_smooth_y)
-                    if auto_smooth_angle is not None:
-                        detect_elbow_vals.append(auto_smooth_angle)
-
-                    if len(detect_shoulder_vals) >= 2:
-                        last_detect_shoulder_range = max(detect_shoulder_vals) - min(detect_shoulder_vals)
-                    else:
-                        last_detect_shoulder_range = 0.0
-                    if len(detect_elbow_vals) >= 2:
-                        last_detect_elbow_range = max(detect_elbow_vals) - min(detect_elbow_vals)
-                    else:
-                        last_detect_elbow_range = 0.0
-
-                    elapsed = now - (detect_start_time or now)
-                    if elapsed >= DETECT_WINDOW_SECONDS:
-                        enough_samples = (
-                            len(detect_shoulder_vals) >= MIN_DETECT_SAMPLES
-                            and len(detect_elbow_vals) >= MIN_DETECT_SAMPLES
-                        )
-                        if not enough_samples and elapsed < (DETECT_WINDOW_SECONDS + 1.0):
-                            pass
-                        else:
-                            shoulder_range = last_detect_shoulder_range
-                            elbow_range = last_detect_elbow_range
-                            if (
-                                shoulder_range >= SHOULDER_RANGE_THRESH
-                                and shoulder_range > (elbow_range * DOMINANCE_K)
-                            ):
-                                locked_mode = "pullup"
-                            elif elbow_range >= ELBOW_RANGE_THRESH:
-                                locked_mode = "dip"
-                            else:
-                                locked_mode = "unknown"
-
-                            auto_state = "LOCKED"
-                            pullup_counter = RepCounterPullup()
-                            dip_counter = RepCounterDip()
-                            last_motion_time = now
-
-                if auto_state == "LOCKED":
-                    if last_motion_time is not None and (now - last_motion_time) > REST_SECONDS:
-                        auto_state = "IDLE"
-                        locked_mode = None
-                        detect_start_time = None
-                        detect_shoulder_vals = []
-                        detect_elbow_vals = []
-                        pullup_counter = RepCounterPullup()
-                        dip_counter = RepCounterDip()
+                if detected_exercise != last_detected_exercise:
+                    if detected_exercise == "pullup":
+                        active_counter = RepCounterPullup()
+                        active_mode = "pullup"
                         rep_count = 0
-                        state = "IDLE"
-                        last_overlay_mode = "auto"
-                    elif locked_mode == "pullup":
-                        extra_val = y_norm
-                        rep_count, state = pullup_counter.update(y_norm, now)
-                        last_overlay_mode = "pullup"
-                    elif locked_mode == "dip":
-                        extra_val = angle
-                        rep_count, state = dip_counter.update(angle, now)
-                        last_overlay_mode = "dip"
+                        state = "WAITING_FOR_REP"
+                    elif detected_exercise == "dip":
+                        active_counter = RepCounterDip()
+                        active_mode = "dip"
+                        rep_count = 0
+                        state = "WAITING_FOR_REP"
                     else:
+                        active_counter = None
+                        active_mode = "auto"
                         rep_count = 0
                         state = "UNKNOWN"
-                        last_overlay_mode = "unknown"
+
+                if detected_exercise == "pullup":
+                    extra_val = y_norm
+                    if active_counter is None:
+                        active_counter = RepCounterPullup()
+                    active_mode = "pullup"
+                    rep_count, state = active_counter.update(y_norm, now)
+                    last_overlay_mode = "pullup"
+                elif detected_exercise == "dip":
+                    extra_val = angle
+                    if active_counter is None:
+                        active_counter = RepCounterDip()
+                    active_mode = "dip"
+                    rep_count, state = active_counter.update(angle, now)
+                    last_overlay_mode = "dip"
                 else:
+                    active_mode = "auto"
                     rep_count = 0
-                    state = auto_state
+                    state = "UNKNOWN"
                     last_overlay_mode = "auto"
             else:
                 if args.mode == "pullup":
@@ -561,8 +505,8 @@ def main():
             last_extra_val = extra_val
             last_rep_count = rep_count
             last_state = state
-            last_auto_state = auto_state
-            last_locked_mode = locked_mode
+            last_active_mode = active_mode
+            last_detected_exercise = detected_exercise
 
         if last_frame is None:
             continue
@@ -575,8 +519,8 @@ def main():
         result = last_result
         kp_dict = last_kp_dict
         overlay_mode = last_overlay_mode
-        auto_state = last_auto_state
-        locked_mode = last_locked_mode
+        detected_exercise = last_detected_exercise
+        active_mode = last_active_mode
 
         # Draw left-side keypoints for debugging
         if result is not None and result.keypoints is not None and len(result.keypoints) > 0:
@@ -587,20 +531,15 @@ def main():
         frame = draw_overlay(frame, overlay_mode, rep_count, state, extra_value=extra_val)
 
         if args.auto:
-            auto_label = f"Auto: {auto_state}"
-            cv2.putText(frame, auto_label, (10, 140),
-                        cv2.FONT_HERSHEY_SIMPLEX, 1.0, (255, 255, 255), 3)
-            if auto_state == "LOCKED":
-                detected = locked_mode.upper() if locked_mode else "UNKNOWN"
-                cv2.putText(frame, f"Detected: {detected}", (10, 175),
-                            cv2.FONT_HERSHEY_SIMPLEX, 1.0, (255, 255, 255), 3)
-                if locked_mode == "unknown":
-                    cv2.putText(frame, "UNKNOWN - keep moving or press 1/2 to force mode",
-                                (10, 210), cv2.FONT_HERSHEY_SIMPLEX, 0.8, (0, 255, 255), 2)
-            elif auto_state == "DETECTING":
-                cv2.putText(frame,
-                            f"ranges: shoulder={last_detect_shoulder_range:.3f}  elbow={last_detect_elbow_range:.1f}",
-                            (10, 175), cv2.FONT_HERSHEY_SIMPLEX, 0.8, (255, 255, 255), 2)
+            cv2.putText(frame, "Auto: ACTIVE", (10, 170),
+                        cv2.FONT_HERSHEY_SIMPLEX, 1.2, (255, 255, 255), 3)
+            detected = detected_exercise.upper() if detected_exercise else "UNKNOWN"
+            cv2.putText(frame, f"Detected: {detected}", (10, 210),
+                        cv2.FONT_HERSHEY_SIMPLEX, 1.2, (255, 255, 255), 3)
+            ws_text = "n/a" if last_ws is None else f"{last_ws:.3f}"
+            cv2.putText(frame,
+                        f"ws: {ws_text} (pu>={WS_PULLUP_THRESH:.2f} dip<={WS_DIP_THRESH:.2f})",
+                        (10, 250), cv2.FONT_HERSHEY_SIMPLEX, 0.9, (255, 255, 255), 2)
 
         # --- Calibration-only behavior (pullups) ---
         if args.calibrate and args.mode == "pullup":
@@ -609,9 +548,9 @@ def main():
                 cv2.putText(
                     frame,
                     f"y_norm (smoothed): {smooth_y:.3f}",
-                    (10, 140),
+                    (10, 170),
                     cv2.FONT_HERSHEY_SIMPLEX,
-                    1.0,
+                    1.2,
                     (255, 255, 0),
                     3,
                 )
@@ -628,23 +567,23 @@ def main():
                 suggested_bottom = max(0.0, min(1.0, bottom_min - 0.05))
                 last_suggested = (suggested_top, suggested_bottom)
 
-                y0 = 175
-                step = 26
+                y0 = 220
+                step = 34
                 cv2.putText(frame, f"bottom mean/min/max: {bottom_mean:.3f} / {bottom_min:.3f} / {bottom_max:.3f}",
-                            (10, y0), cv2.FONT_HERSHEY_SIMPLEX, 0.8, (200, 255, 200), 2)
+                            (10, y0), cv2.FONT_HERSHEY_SIMPLEX, 1.0, (200, 255, 200), 2)
                 cv2.putText(frame, f"top    mean/min/max: {top_mean:.3f} / {top_min:.3f} / {top_max:.3f}",
-                            (10, y0 + step), cv2.FONT_HERSHEY_SIMPLEX, 0.8, (200, 255, 200), 2)
+                            (10, y0 + step), cv2.FONT_HERSHEY_SIMPLEX, 1.0, (200, 255, 200), 2)
                 cv2.putText(frame, f"suggested top/bottom: {suggested_top:.3f} / {suggested_bottom:.3f}",
-                            (10, y0 + 2 * step), cv2.FONT_HERSHEY_SIMPLEX, 0.8, (200, 255, 0), 2)
+                            (10, y0 + 2 * step), cv2.FONT_HERSHEY_SIMPLEX, 1.0, (200, 255, 0), 2)
         elif args.calibrate and args.mode == "dip":
             smooth_angle = counter.smooth_angle
             if smooth_angle is not None:
                 cv2.putText(
                     frame,
                     f"elbow angle (smoothed): {smooth_angle:.1f} deg",
-                    (10, 140),
+                    (10, 170),
                     cv2.FONT_HERSHEY_SIMPLEX,
-                    1.0,
+                    1.2,
                     (255, 255, 0),
                     3,
                 )
@@ -664,21 +603,25 @@ def main():
                     suggested_top = top_min
                 last_suggested = (suggested_top, suggested_bottom)
 
-                y0 = 175
-                step = 26
+                y0 = 220
+                step = 34
                 cv2.putText(frame, f"bottom mean/min/max: {bottom_mean:.1f} / {bottom_min:.1f} / {bottom_max:.1f}",
-                            (10, y0), cv2.FONT_HERSHEY_SIMPLEX, 0.8, (200, 255, 200), 2)
+                            (10, y0), cv2.FONT_HERSHEY_SIMPLEX, 1.0, (200, 255, 200), 2)
                 cv2.putText(frame, f"top    mean/min/max: {top_mean:.1f} / {top_min:.1f} / {top_max:.1f}",
-                            (10, y0 + step), cv2.FONT_HERSHEY_SIMPLEX, 0.8, (200, 255, 200), 2)
+                            (10, y0 + step), cv2.FONT_HERSHEY_SIMPLEX, 1.0, (200, 255, 200), 2)
                 cv2.putText(frame, f"suggested top/bottom: {suggested_top:.1f} / {suggested_bottom:.1f}",
-                            (10, y0 + 2 * step), cv2.FONT_HERSHEY_SIMPLEX, 0.8, (200, 255, 0), 2)
+                            (10, y0 + 2 * step), cv2.FONT_HERSHEY_SIMPLEX, 1.0, (200, 255, 0), 2)
+        if args.calibrate:
+            cv2.putText(frame,
+                        f"wrist tune: ws_pu>={WS_PULLUP_THRESH:.3f} ws_dip<={WS_DIP_THRESH:.3f}",
+                        (10, frame_h - 60), cv2.FONT_HERSHEY_SIMPLEX, 0.9, (255, 255, 255), 2)
 
         if paused:
             cv2.putText(frame, "PAUSED", (10, frame_h - 30),
-                        cv2.FONT_HERSHEY_SIMPLEX, 1.2, (0, 0, 255), 3)
+                        cv2.FONT_HERSHEY_SIMPLEX, 1.6, (0, 0, 255), 4)
 
         # Pause/Play button (top-right)
-        btn_w, btn_h = 150, 50
+        btn_w, btn_h = 180, 60
         margin = 10
         x2 = frame_w - margin
         y1 = margin
@@ -687,8 +630,8 @@ def main():
         button_rect = (x1, y1, x2, y2)
         cv2.rectangle(frame, (x1, y1), (x2, y2), (30, 30, 30), -1)
         label = "PLAY" if paused else "PAUSE"
-        cv2.putText(frame, label, (x1 + 15, y1 + 34),
-                    cv2.FONT_HERSHEY_SIMPLEX, 1.0, (255, 255, 255), 3)
+        cv2.putText(frame, label, (x1 + 18, y1 + 40),
+                    cv2.FONT_HERSHEY_SIMPLEX, 1.2, (255, 255, 255), 3)
 
         cv2.imshow(window_name, frame)
         key = cv2.waitKey(1) & 0xFF
@@ -696,49 +639,27 @@ def main():
             paused = not paused
         if args.auto:
             if key == ord("1"):
-                auto_state = "LOCKED"
-                locked_mode = "pullup"
-                detect_start_time = None
-                detect_shoulder_vals = []
-                detect_elbow_vals = []
-                last_detect_shoulder_range = 0.0
-                last_detect_elbow_range = 0.0
-                pullup_counter = RepCounterPullup()
-                dip_counter = RepCounterDip()
-                last_motion_time = time.time()
+                detected_exercise = "pullup"
+                active_counter = RepCounterPullup()
+                active_mode = "pullup"
                 last_rep_count = 0
                 last_state = "WAITING_FOR_REP"
                 last_overlay_mode = "pullup"
             elif key == ord("2"):
-                auto_state = "LOCKED"
-                locked_mode = "dip"
-                detect_start_time = None
-                detect_shoulder_vals = []
-                detect_elbow_vals = []
-                last_detect_shoulder_range = 0.0
-                last_detect_elbow_range = 0.0
-                pullup_counter = RepCounterPullup()
-                dip_counter = RepCounterDip()
-                last_motion_time = time.time()
+                detected_exercise = "dip"
+                active_counter = RepCounterDip()
+                active_mode = "dip"
                 last_rep_count = 0
                 last_state = "WAITING_FOR_REP"
                 last_overlay_mode = "dip"
             elif key == ord("0"):
-                auto_state = "IDLE"
-                locked_mode = None
-                detect_start_time = None
-                detect_shoulder_vals = []
-                detect_elbow_vals = []
-                last_detect_shoulder_range = 0.0
-                last_detect_elbow_range = 0.0
-                pullup_counter = RepCounterPullup()
-                dip_counter = RepCounterDip()
-                last_motion_time = None
+                detected_exercise = None
+                active_counter = None
+                active_mode = "auto"
                 last_rep_count = 0
                 last_state = "IDLE"
                 last_overlay_mode = "auto"
-            last_auto_state = auto_state
-            last_locked_mode = locked_mode
+            last_detected_exercise = detected_exercise
         if args.calibrate:
             if args.mode == "pullup":
                 if key == ord("b") and counter.smooth_y is not None:
