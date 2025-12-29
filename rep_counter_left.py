@@ -43,6 +43,16 @@ DIP_BOTTOM_ANGLE = 90.0        # TUNE_ME: angle at deepest part
 # --- Rep debounce ---
 MIN_TIME_BETWEEN_REPS = 0.35    # TUNE_ME: seconds; avoid double-counting fast jitters
 
+# --- Auto-detect tuning ---
+DETECT_WINDOW_SECONDS = 2.0     # TUNE_ME: seconds to collect detection samples
+REST_SECONDS = 4.0              # TUNE_ME: seconds of rest to reset auto mode
+SHOULDER_RANGE_THRESH = 0.06    # TUNE_ME: y_norm range to indicate pullups
+ELBOW_RANGE_THRESH = 30.0       # TUNE_ME: angle range to indicate dips
+DOMINANCE_K = 1.3               # TUNE_ME: shoulder range dominance vs elbow range
+MOTION_EPS_Y = 0.01             # TUNE_ME: y_norm delta to count as movement
+MOTION_EPS_ANGLE = 3.0          # TUNE_ME: angle delta (deg) to count as movement
+MIN_DETECT_SAMPLES = 5          # TUNE_ME: minimum samples per signal for detection
+
 
 # ===============================
 # KEYPOINT INDEX MAP (COCO order)
@@ -284,7 +294,7 @@ def ensure_model_path(model_arg):
 
 def main():
     parser = argparse.ArgumentParser(description="YOLO-based rep counter (pullups & dips, LEFT-side view).")
-    parser.add_argument("--mode", choices=["pullup", "dip"], required=True,
+    parser.add_argument("--mode", choices=["pullup", "dip"], required=False,
                         help="Exercise mode: pullup or dip")
     parser.add_argument("--model", type=str, default=str(DEFAULT_MODEL_PATH),
                         help="Path to YOLO pose model (e.g., yolov8n-pose.pt)")
@@ -295,9 +305,14 @@ def main():
     parser.add_argument("--backend", type=str, default=None,
                         choices=["avfoundation", "any", "default"],
                         help="OpenCV backend: avfoundation, any, or default.")
+    parser.add_argument("--auto", action="store_true",
+                        help="Auto-detect exercise (pullup or dip).")
     parser.add_argument("--calibrate", action="store_true",
                         help="Calibration mode (pullup or dip). Press b/t to sample, r to reset.")
     args = parser.parse_args()
+
+    if not args.auto and args.mode is None:
+        parser.error("--mode is required unless --auto is set.")
 
     model_path = ensure_model_path(args.model)
     print(f"Loading model: {model_path}")
@@ -330,10 +345,16 @@ def main():
             if ret:
                 warmup_frames += 1
 
-    if args.mode == "pullup":
-        counter = RepCounterPullup()
+    if args.auto:
+        pullup_counter = RepCounterPullup()
+        dip_counter = RepCounterDip()
     else:
-        counter = RepCounterDip()
+        if args.mode == "pullup":
+            counter = RepCounterPullup()
+        else:
+            counter = RepCounterDip()
+    if args.auto and args.mode in ("pullup", "dip"):
+        counter = pullup_counter if args.mode == "pullup" else dip_counter
 
     paused = False
     if args.calibrate:
@@ -353,6 +374,21 @@ def main():
     last_state = "WAITING_FOR_REP"
     last_suggested_msg = None
     last_suggested_time = 0.0
+    auto_state = "IDLE"
+    locked_mode = None
+    detect_start_time = None
+    detect_shoulder_vals = []
+    detect_elbow_vals = []
+    auto_smooth_y = None
+    auto_smooth_angle = None
+    last_auto_smooth_y = None
+    last_auto_smooth_angle = None
+    last_motion_time = None
+    last_detect_shoulder_range = 0.0
+    last_detect_elbow_range = 0.0
+    last_overlay_mode = "auto" if args.auto else args.mode
+    last_auto_state = auto_state
+    last_locked_mode = locked_mode
     button_rect = (0, 0, 0, 0)
     window_name = "Rep Counter (Left Side)"
 
@@ -412,23 +448,121 @@ def main():
 
             now = time.time()
             extra_val = None
+            y_norm = None
+            angle = None
+            if kp_dict is not None:
+                y_norm = compute_left_shoulder_y_norm(kp_dict, frame_h)
+                angle = angle_at_left_elbow(kp_dict)
 
-            if args.mode == "pullup":
-                y_norm = None
-                if kp_dict is not None:
-                    y_norm = compute_left_shoulder_y_norm(kp_dict, frame_h)
-                extra_val = y_norm
-                rep_count, state = counter.update(y_norm, now)
-            else:  # dip
-                angle = None
-                if kp_dict is not None:
-                    angle = angle_at_left_elbow(kp_dict)
-                extra_val = angle
-                rep_count, state = counter.update(angle, now)
+            if args.auto:
+                if y_norm is not None:
+                    auto_smooth_y = exponential_smooth(y_norm, auto_smooth_y, SMOOTHING_ALPHA)
+                if angle is not None:
+                    auto_smooth_angle = exponential_smooth(angle, auto_smooth_angle, SMOOTHING_ALPHA)
+
+                moved = False
+                if auto_smooth_y is not None and last_auto_smooth_y is not None:
+                    if abs(auto_smooth_y - last_auto_smooth_y) > MOTION_EPS_Y:
+                        moved = True
+                if auto_smooth_angle is not None and last_auto_smooth_angle is not None:
+                    if abs(auto_smooth_angle - last_auto_smooth_angle) > MOTION_EPS_ANGLE:
+                        moved = True
+                if moved:
+                    last_motion_time = now
+
+                last_auto_smooth_y = auto_smooth_y
+                last_auto_smooth_angle = auto_smooth_angle
+
+                if auto_state == "IDLE":
+                    if moved:
+                        auto_state = "DETECTING"
+                        detect_start_time = now
+                        detect_shoulder_vals = []
+                        detect_elbow_vals = []
+
+                if auto_state == "DETECTING":
+                    if auto_smooth_y is not None:
+                        detect_shoulder_vals.append(auto_smooth_y)
+                    if auto_smooth_angle is not None:
+                        detect_elbow_vals.append(auto_smooth_angle)
+
+                    if len(detect_shoulder_vals) >= 2:
+                        last_detect_shoulder_range = max(detect_shoulder_vals) - min(detect_shoulder_vals)
+                    else:
+                        last_detect_shoulder_range = 0.0
+                    if len(detect_elbow_vals) >= 2:
+                        last_detect_elbow_range = max(detect_elbow_vals) - min(detect_elbow_vals)
+                    else:
+                        last_detect_elbow_range = 0.0
+
+                    elapsed = now - (detect_start_time or now)
+                    if elapsed >= DETECT_WINDOW_SECONDS:
+                        enough_samples = (
+                            len(detect_shoulder_vals) >= MIN_DETECT_SAMPLES
+                            and len(detect_elbow_vals) >= MIN_DETECT_SAMPLES
+                        )
+                        if not enough_samples and elapsed < (DETECT_WINDOW_SECONDS + 1.0):
+                            pass
+                        else:
+                            shoulder_range = last_detect_shoulder_range
+                            elbow_range = last_detect_elbow_range
+                            if (
+                                shoulder_range >= SHOULDER_RANGE_THRESH
+                                and shoulder_range > (elbow_range * DOMINANCE_K)
+                            ):
+                                locked_mode = "pullup"
+                            elif elbow_range >= ELBOW_RANGE_THRESH:
+                                locked_mode = "dip"
+                            else:
+                                locked_mode = "unknown"
+
+                            auto_state = "LOCKED"
+                            pullup_counter = RepCounterPullup()
+                            dip_counter = RepCounterDip()
+                            last_motion_time = now
+
+                if auto_state == "LOCKED":
+                    if last_motion_time is not None and (now - last_motion_time) > REST_SECONDS:
+                        auto_state = "IDLE"
+                        locked_mode = None
+                        detect_start_time = None
+                        detect_shoulder_vals = []
+                        detect_elbow_vals = []
+                        pullup_counter = RepCounterPullup()
+                        dip_counter = RepCounterDip()
+                        rep_count = 0
+                        state = "IDLE"
+                        last_overlay_mode = "auto"
+                    elif locked_mode == "pullup":
+                        extra_val = y_norm
+                        rep_count, state = pullup_counter.update(y_norm, now)
+                        last_overlay_mode = "pullup"
+                    elif locked_mode == "dip":
+                        extra_val = angle
+                        rep_count, state = dip_counter.update(angle, now)
+                        last_overlay_mode = "dip"
+                    else:
+                        rep_count = 0
+                        state = "UNKNOWN"
+                        last_overlay_mode = "unknown"
+                else:
+                    rep_count = 0
+                    state = auto_state
+                    last_overlay_mode = "auto"
+            else:
+                if args.mode == "pullup":
+                    extra_val = y_norm
+                    rep_count, state = counter.update(y_norm, now)
+                else:  # dip
+                    extra_val = angle
+                    rep_count, state = counter.update(angle, now)
+                last_overlay_mode = args.mode
 
             last_extra_val = extra_val
             last_rep_count = rep_count
             last_state = state
+            last_auto_state = auto_state
+            last_locked_mode = locked_mode
 
         if last_frame is None:
             continue
@@ -440,6 +574,9 @@ def main():
         extra_val = last_extra_val
         result = last_result
         kp_dict = last_kp_dict
+        overlay_mode = last_overlay_mode
+        auto_state = last_auto_state
+        locked_mode = last_locked_mode
 
         # Draw left-side keypoints for debugging
         if result is not None and result.keypoints is not None and len(result.keypoints) > 0:
@@ -447,7 +584,23 @@ def main():
                 for x, y in person:
                     cv2.circle(frame, (int(x), int(y)), 3, (0, 0, 255), -1)
 
-        frame = draw_overlay(frame, args.mode, rep_count, state, extra_value=extra_val)
+        frame = draw_overlay(frame, overlay_mode, rep_count, state, extra_value=extra_val)
+
+        if args.auto:
+            auto_label = f"Auto: {auto_state}"
+            cv2.putText(frame, auto_label, (10, 140),
+                        cv2.FONT_HERSHEY_SIMPLEX, 1.0, (255, 255, 255), 3)
+            if auto_state == "LOCKED":
+                detected = locked_mode.upper() if locked_mode else "UNKNOWN"
+                cv2.putText(frame, f"Detected: {detected}", (10, 175),
+                            cv2.FONT_HERSHEY_SIMPLEX, 1.0, (255, 255, 255), 3)
+                if locked_mode == "unknown":
+                    cv2.putText(frame, "UNKNOWN - keep moving or press 1/2 to force mode",
+                                (10, 210), cv2.FONT_HERSHEY_SIMPLEX, 0.8, (0, 255, 255), 2)
+            elif auto_state == "DETECTING":
+                cv2.putText(frame,
+                            f"ranges: shoulder={last_detect_shoulder_range:.3f}  elbow={last_detect_elbow_range:.1f}",
+                            (10, 175), cv2.FONT_HERSHEY_SIMPLEX, 0.8, (255, 255, 255), 2)
 
         # --- Calibration-only behavior (pullups) ---
         if args.calibrate and args.mode == "pullup":
@@ -541,6 +694,51 @@ def main():
         key = cv2.waitKey(1) & 0xFF
         if key == 32:
             paused = not paused
+        if args.auto:
+            if key == ord("1"):
+                auto_state = "LOCKED"
+                locked_mode = "pullup"
+                detect_start_time = None
+                detect_shoulder_vals = []
+                detect_elbow_vals = []
+                last_detect_shoulder_range = 0.0
+                last_detect_elbow_range = 0.0
+                pullup_counter = RepCounterPullup()
+                dip_counter = RepCounterDip()
+                last_motion_time = time.time()
+                last_rep_count = 0
+                last_state = "WAITING_FOR_REP"
+                last_overlay_mode = "pullup"
+            elif key == ord("2"):
+                auto_state = "LOCKED"
+                locked_mode = "dip"
+                detect_start_time = None
+                detect_shoulder_vals = []
+                detect_elbow_vals = []
+                last_detect_shoulder_range = 0.0
+                last_detect_elbow_range = 0.0
+                pullup_counter = RepCounterPullup()
+                dip_counter = RepCounterDip()
+                last_motion_time = time.time()
+                last_rep_count = 0
+                last_state = "WAITING_FOR_REP"
+                last_overlay_mode = "dip"
+            elif key == ord("0"):
+                auto_state = "IDLE"
+                locked_mode = None
+                detect_start_time = None
+                detect_shoulder_vals = []
+                detect_elbow_vals = []
+                last_detect_shoulder_range = 0.0
+                last_detect_elbow_range = 0.0
+                pullup_counter = RepCounterPullup()
+                dip_counter = RepCounterDip()
+                last_motion_time = None
+                last_rep_count = 0
+                last_state = "IDLE"
+                last_overlay_mode = "auto"
+            last_auto_state = auto_state
+            last_locked_mode = locked_mode
         if args.calibrate:
             if args.mode == "pullup":
                 if key == ord("b") and counter.smooth_y is not None:
