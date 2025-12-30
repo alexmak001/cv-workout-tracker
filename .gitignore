@@ -2,6 +2,8 @@
 .venv_tts/
 
 *.mp4
+*.wav
+*.MOV
 
 testVids/
 
